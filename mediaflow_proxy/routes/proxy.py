@@ -196,6 +196,33 @@ async def hls_manifest_proxy(
     return await handle_hls_stream_proxy(request, hls_params, proxy_headers)
 
 
+@proxy_router.head("/hls/key_proxy/manifest.m3u8", name="hls_key_proxy")
+@proxy_router.get("/hls/key_proxy/manifest.m3u8", name="hls_key_proxy")
+async def hls_key_proxy(
+    request: Request,
+    hls_params: Annotated[HLSManifestParams, Query()],
+    proxy_headers: Annotated[ProxyRequestHeaders, Depends(get_proxy_headers)],
+):
+    """
+    Proxify HLS stream requests, but only proxy the key URL, leaving segment URLs direct.
+
+    Args:
+        request (Request): The incoming HTTP request.
+        hls_params (HLSManifestParams): The parameters for the HLS stream request.
+        proxy_headers (ProxyRequestHeaders): The headers to include in the request.
+
+    Returns:
+        Response: The HTTP response with the processed m3u8 playlist.
+    """
+    # Sanitize destination URL to fix common encoding issues
+    hls_params.destination = sanitize_url(hls_params.destination)
+    
+    # Set the key_only_proxy flag to True
+    hls_params.key_only_proxy = True
+    
+    return await handle_hls_stream_proxy(request, hls_params, proxy_headers)
+
+
 @proxy_router.get("/hls/segment")
 async def hls_segment_proxy(
     request: Request,
@@ -240,30 +267,7 @@ async def hls_segment_proxy(
             )
     
     # Fallback to direct streaming if not in cache
-    # Use SSL verification setting for HLS segment requests
-    from mediaflow_proxy.configs import settings
-    from mediaflow_proxy.handlers import setup_client_and_streamer
-    from mediaflow_proxy.utils.http_utils import EnhancedStreamingResponse
-    from starlette.background import BackgroundTask
-    
-    verify_ssl = not settings.disable_ssl_verification_for_hls
-    client, streamer = await setup_client_and_streamer(verify_ssl=verify_ssl)
-    
-    try:
-        await streamer.create_streaming_response(segment_url, proxy_headers.request)
-        response_headers = {k: v for k, v in streamer.response.headers.multi_items()}
-        response_headers.update(proxy_headers.response)
-        
-        return EnhancedStreamingResponse(
-            streamer.stream_content(),
-            headers=response_headers,
-            status_code=streamer.response.status_code,
-            background=BackgroundTask(streamer.close),
-        )
-    except Exception as e:
-        await streamer.close()
-        from mediaflow_proxy.handlers import handle_exceptions
-        return handle_exceptions(e)
+    return await handle_stream_request("GET", segment_url, proxy_headers)
 
 
 @proxy_router.get("/dash/segment")
@@ -310,30 +314,7 @@ async def dash_segment_proxy(
             )
     
     # Fallback to direct streaming if not in cache
-    # Use SSL verification setting for DASH segment requests
-    from mediaflow_proxy.configs import settings
-    from mediaflow_proxy.handlers import setup_client_and_streamer
-    from mediaflow_proxy.utils.http_utils import EnhancedStreamingResponse
-    from starlette.background import BackgroundTask
-    
-    verify_ssl = not settings.disable_ssl_verification_for_hls
-    client, streamer = await setup_client_and_streamer(verify_ssl=verify_ssl)
-    
-    try:
-        await streamer.create_streaming_response(segment_url, proxy_headers.request)
-        response_headers = {k: v for k, v in streamer.response.headers.multi_items()}
-        response_headers.update(proxy_headers.response)
-        
-        return EnhancedStreamingResponse(
-            streamer.stream_content(),
-            headers=response_headers,
-            status_code=streamer.response.status_code,
-            background=BackgroundTask(streamer.close),
-        )
-    except Exception as e:
-        await streamer.close()
-        from mediaflow_proxy.handlers import handle_exceptions
-        return handle_exceptions(e)
+    return await handle_stream_request("GET", segment_url, proxy_headers)
 
 
 @proxy_router.head("/stream")

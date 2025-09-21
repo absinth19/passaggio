@@ -26,17 +26,14 @@ from .utils.mpd_utils import pad_base64
 logger = logging.getLogger(__name__)
 
 
-async def setup_client_and_streamer(verify_ssl: bool = True) -> tuple[httpx.AsyncClient, Streamer]:
+async def setup_client_and_streamer() -> tuple[httpx.AsyncClient, Streamer]:
     """
     Set up an HTTP client and a streamer.
-
-    Args:
-        verify_ssl (bool): Whether to verify SSL certificates.
 
     Returns:
         tuple: An httpx.AsyncClient instance and a Streamer instance.
     """
-    client = create_httpx_client(verify_ssl=verify_ssl)
+    client = create_httpx_client()
     return client, Streamer(client)
 
 
@@ -79,10 +76,7 @@ async def handle_hls_stream_proxy(
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a processed m3u8 playlist or a streaming response.
     """
-    from .configs import settings
-    # Use SSL verification setting for HLS endpoints
-    verify_ssl = not settings.disable_ssl_verification_for_hls
-    _, streamer = await setup_client_and_streamer(verify_ssl=verify_ssl)
+    _, streamer = await setup_client_and_streamer()
     # Handle range requests
     content_range = proxy_headers.request.get("range", "bytes=0-")
     if "nan" in content_range.casefold():
@@ -108,7 +102,8 @@ async def handle_hls_stream_proxy(
         # If force_playlist_proxy is enabled, skip detection and directly process as m3u8
         if hls_params.force_playlist_proxy:
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url, hls_params.force_playlist_proxy
+                streamer, hls_params.destination, proxy_headers, request, 
+                hls_params.key_url, hls_params.force_playlist_proxy, hls_params.key_only_proxy
             )
 
         parsed_url = urlparse(hls_params.destination)
@@ -117,7 +112,8 @@ async def handle_hls_stream_proxy(
             0
         ] in ["m3u", "m3u8", "m3u_plus"]:
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url, hls_params.force_playlist_proxy
+                streamer, hls_params.destination, proxy_headers, request, 
+                hls_params.key_url, hls_params.force_playlist_proxy, hls_params.key_only_proxy
             )
 
         # Create initial streaming response to check content type
@@ -126,7 +122,8 @@ async def handle_hls_stream_proxy(
 
         if "mpegurl" in response_headers.get("content-type", "").lower():
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url, hls_params.force_playlist_proxy
+                streamer, hls_params.destination, proxy_headers, request, 
+                hls_params.key_url, hls_params.force_playlist_proxy, hls_params.key_only_proxy
             )
 
         return EnhancedStreamingResponse(
@@ -158,8 +155,7 @@ async def handle_stream_request(
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a HEAD response with headers or a streaming response.
     """
-    # Keep SSL verification enabled for /proxy/stream endpoints
-    client, streamer = await setup_client_and_streamer(verify_ssl=True)
+    client, streamer = await setup_client_and_streamer()
 
     try:
         # Auto-detect and resolve Vavoo links
@@ -231,7 +227,13 @@ async def proxy_stream(method: str, destination: str, proxy_headers: ProxyReques
 
 
 async def fetch_and_process_m3u8(
-    streamer: Streamer, url: str, proxy_headers: ProxyRequestHeaders, request: Request, key_url: str = None, force_playlist_proxy: bool = None
+    streamer: Streamer, 
+    url: str, 
+    proxy_headers: ProxyRequestHeaders, 
+    request: Request, 
+    key_url: str = None, 
+    force_playlist_proxy: bool = None,
+    key_only_proxy: bool = False
 ):
     """
     Fetches and processes the m3u8 playlist on-the-fly, converting it to an HLS playlist.
@@ -243,6 +245,7 @@ async def fetch_and_process_m3u8(
         request (Request): The incoming HTTP request.
         key_url (str, optional): The HLS Key URL to replace the original key URL. Defaults to None.
         force_playlist_proxy (bool, optional): Force all playlist URLs to be proxied through MediaFlow. Defaults to None.
+        key_only_proxy (bool, optional): Only proxy the key URL, leaving segment URLs direct. Defaults to False.
 
     Returns:
         Response: The HTTP response with the processed m3u8 playlist.
@@ -253,7 +256,7 @@ async def fetch_and_process_m3u8(
             await streamer.create_streaming_response(url, proxy_headers.request)
 
         # Initialize processor and response headers
-        processor = M3U8Processor(request, key_url, force_playlist_proxy)
+        processor = M3U8Processor(request, key_url, force_playlist_proxy, key_only_proxy)
         response_headers = {
             "content-disposition": "inline",
             "accept-ranges": "none",
@@ -318,14 +321,10 @@ async def get_manifest(
         Response: The HTTP response with the HLS manifest.
     """
     try:
-        from .configs import settings
-        # Use SSL verification setting for MPD downloads
-        verify_ssl = not settings.disable_ssl_verification_for_hls
         mpd_dict = await get_cached_mpd(
             manifest_params.destination,
             headers=proxy_headers.request,
             parse_drm=not manifest_params.key_id and not manifest_params.key,
-            verify_ssl=verify_ssl,
         )
     except DownloadError as e:
         raise HTTPException(status_code=e.status_code, detail=f"Failed to download MPD: {e.message}")
@@ -363,15 +362,11 @@ async def get_playlist(
         Response: The HTTP response with the HLS playlist.
     """
     try:
-        from .configs import settings
-        # Use SSL verification setting for MPD downloads
-        verify_ssl = not settings.disable_ssl_verification_for_hls
         mpd_dict = await get_cached_mpd(
             playlist_params.destination,
             headers=proxy_headers.request,
             parse_drm=not playlist_params.key_id and not playlist_params.key,
             parse_segment_profile_id=playlist_params.profile_id,
-            verify_ssl=verify_ssl,
         )
     except DownloadError as e:
         raise HTTPException(status_code=e.status_code, detail=f"Failed to download MPD: {e.message}")
@@ -393,11 +388,8 @@ async def get_segment(
         Response: The HTTP response with the processed segment.
     """
     try:
-        from .configs import settings
-        # Use SSL verification setting for segment downloads
-        verify_ssl = not settings.disable_ssl_verification_for_hls
-        init_content = await get_cached_init_segment(segment_params.init_url, proxy_headers.request, verify_ssl=verify_ssl)
-        segment_content = await download_file_with_retry(segment_params.segment_url, proxy_headers.request, verify_ssl=verify_ssl)
+        init_content = await get_cached_init_segment(segment_params.init_url, proxy_headers.request)
+        segment_content = await download_file_with_retry(segment_params.segment_url, proxy_headers.request)
     except Exception as e:
         return handle_exceptions(e)
 
@@ -418,5 +410,5 @@ async def get_public_ip():
     Returns:
         Response: The HTTP response with the public IP address.
     """
-    ip_address_data = await request_with_retry("GET", "https://api.ipify.org?format=json", {}, verify_ssl=True)
+    ip_address_data = await request_with_retry("GET", "https://api.ipify.org?format=json", {})
     return ip_address_data.json()

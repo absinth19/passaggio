@@ -49,10 +49,6 @@ class TransportConfig(BaseSettings):
             verify=False, proxy=self.proxy_url if self.all_proxy else None
         )
         
-        mounts["all://newkso.ru"] = transport_cls(
-            verify=False, proxy=self.proxy_url if self.all_proxy else None
-        )
-        
         mounts["all://*.newkso.ru"] = transport_cls(
             verify=False, proxy=self.proxy_url if self.all_proxy else None
         )
@@ -90,7 +86,6 @@ class Settings(BaseSettings):
     dash_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
     dash_prebuffer_max_memory_percent: int = 80  # Maximum percentage of system memory to use for DASH pre-buffer cache.
     dash_prebuffer_emergency_threshold: int = 90  # Emergency threshold percentage to trigger aggressive cache cleanup.
-    disable_ssl_verification_for_hls: bool = False  # Whether to disable SSL verification for HLS proxy endpoints to avoid certificate errors.
 
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"  # The user agent to use for HTTP requests.
