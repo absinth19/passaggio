@@ -3,7 +3,7 @@ import typing
 from dataclasses import dataclass
 from functools import partial
 from urllib import parse
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import anyio
 import h11
@@ -81,6 +81,10 @@ async def fetch_with_retry(client, method, url, headers, follow_redirects=True, 
 
 
 class Streamer:
+    # PNG signature and IEND marker for fake PNG header detection (StreamWish/FileMoon)
+    _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+    _PNG_IEND_MARKER = b"\x49\x45\x4E\x44\xAE\x42\x60\x82"
+
     def __init__(self, client):
         """
         Initializes the Streamer with an HTTP client.
@@ -132,12 +136,47 @@ class Streamer:
             logger.error(f"Error creating streaming response: {e}")
             raise RuntimeError(f"Error creating streaming response: {e}")
 
+    @staticmethod
+    def _strip_fake_png_wrapper(chunk: bytes) -> bytes:
+        """
+        Strip fake PNG wrapper from chunk data.
+
+        Some streaming services (StreamWish, FileMoon) prepend a fake PNG image
+        to video data to evade detection. This method detects and removes it.
+
+        Args:
+            chunk: The raw chunk data that may contain a fake PNG header.
+
+        Returns:
+            The chunk with fake PNG wrapper removed, or original chunk if not present.
+        """
+        if not chunk.startswith(Streamer._PNG_SIGNATURE):
+            return chunk
+
+        # Find the IEND marker that signals end of PNG data
+        iend_pos = chunk.find(Streamer._PNG_IEND_MARKER)
+        if iend_pos == -1:
+            # IEND not found in this chunk - return as-is to avoid data corruption
+            logger.debug("PNG signature detected but IEND marker not found in chunk")
+            return chunk
+
+        # Calculate position after IEND marker
+        content_start = iend_pos + len(Streamer._PNG_IEND_MARKER)
+
+        # Skip any padding bytes (null or 0xFF) between PNG and actual content
+        while content_start < len(chunk) and chunk[content_start] in (0x00, 0xFF):
+            content_start += 1
+
+        stripped_bytes = content_start
+        logger.debug(f"Stripped {stripped_bytes} bytes of fake PNG wrapper from stream")
+
+        return chunk[content_start:]
+
     async def stream_content(self) -> typing.AsyncGenerator[bytes, None]:
-        """
-        Streams the content from the response.
-        """
         if not self.response:
             raise RuntimeError("No response available for streaming")
+
+        is_first_chunk = True
 
         try:
             self.parse_content_range()
@@ -154,15 +193,19 @@ class Streamer:
                     mininterval=1,
                 ) as self.progress_bar:
                     async for chunk in self.response.aiter_bytes():
+                        if is_first_chunk:
+                            is_first_chunk = False
+                            chunk = self._strip_fake_png_wrapper(chunk)
+
                         yield chunk
-                        chunk_size = len(chunk)
-                        self.bytes_transferred += chunk_size
-                        self.progress_bar.set_postfix_str(
-                            f"📥 : {self.format_bytes(self.bytes_transferred)}", refresh=False
-                        )
-                        self.progress_bar.update(chunk_size)
+                        self.bytes_transferred += len(chunk)
+                        self.progress_bar.update(len(chunk))
             else:
                 async for chunk in self.response.aiter_bytes():
+                    if is_first_chunk:
+                        is_first_chunk = False
+                        chunk = self._strip_fake_png_wrapper(chunk)
+
                     yield chunk
                     self.bytes_transferred += len(chunk)
 
@@ -187,10 +230,19 @@ class Streamer:
                 raise DownloadError(502, f"Protocol error while streaming: {e}")
         except GeneratorExit:
             logger.info("Streaming session stopped by the user")
+        except httpx.ReadError as e:
+            # Handle network read errors gracefully - these occur when upstream connection drops
+            logger.warning(f"ReadError while streaming: {e}")
+            if self.bytes_transferred > 0:
+                logger.info(f"Partial content received ({self.bytes_transferred} bytes) before ReadError. Graceful termination.")
+                return
+            else:
+                raise DownloadError(502, f"ReadError while streaming: {e}")
         except Exception as e:
             logger.error(f"Error streaming content: {e}")
             raise
 
+            
     @staticmethod
     def format_bytes(size) -> str:
         power = 2**10
@@ -296,6 +348,7 @@ def encode_mediaflow_proxy_url(
     query_params: typing.Optional[dict] = None,
     request_headers: typing.Optional[dict] = None,
     response_headers: typing.Optional[dict] = None,
+    remove_response_headers: typing.Optional[list[str]] = None,
     encryption_handler: EncryptionHandler = None,
     expiration: int = None,
     ip: str = None,
@@ -311,6 +364,7 @@ def encode_mediaflow_proxy_url(
         query_params (dict, optional): Additional query parameters to include. Defaults to None.
         request_headers (dict, optional): Headers to include as query parameters. Defaults to None.
         response_headers (dict, optional): Headers to include as query parameters. Defaults to None.
+        remove_response_headers (list[str], optional): List of response header names to remove. Defaults to None.
         encryption_handler (EncryptionHandler, optional): The encryption handler to use. Defaults to None.
         expiration (int, optional): The expiration time for the encrypted token. Defaults to None.
         ip (str, optional): The public IP address to include in the query parameters. Defaults to None.
@@ -324,15 +378,19 @@ def encode_mediaflow_proxy_url(
     if destination_url is not None:
         query_params["d"] = destination_url
 
-    # Add headers if provided
+    # Add headers if provided (always use lowercase prefix for consistency)
     if request_headers:
         query_params.update(
-            {key if key.startswith("h_") else f"h_{key}": value for key, value in request_headers.items()}
+            {key if key.lower().startswith("h_") else f"h_{key}": value for key, value in request_headers.items()}
         )
     if response_headers:
         query_params.update(
-            {key if key.startswith("r_") else f"r_{key}": value for key, value in response_headers.items()}
+            {key if key.lower().startswith("r_") else f"r_{key}": value for key, value in response_headers.items()}
         )
+    
+    # Add remove headers if provided (x_ prefix for "exclude")
+    if remove_response_headers:
+        query_params["x_headers"] = ",".join(remove_response_headers)
 
     # Construct the base URL
     if endpoint is None:
@@ -476,6 +534,27 @@ def get_original_scheme(request: Request) -> str:
 class ProxyRequestHeaders:
     request: dict
     response: dict
+    remove: list  # headers to remove from response
+
+
+def apply_header_manipulation(base_headers: dict, proxy_headers: ProxyRequestHeaders) -> dict:
+    """
+    Apply response header additions and removals.
+    
+    This function filters out headers specified in proxy_headers.remove,
+    then merges in headers from proxy_headers.response.
+    
+    Args:
+        base_headers (dict): The base headers to start with.
+        proxy_headers (ProxyRequestHeaders): The proxy headers containing response additions and removals.
+    
+    Returns:
+        dict: The manipulated headers.
+    """
+    remove_set = set(h.lower() for h in proxy_headers.remove)
+    result = {k: v for k, v in base_headers.items() if k.lower() not in remove_set}
+    result.update(proxy_headers.response)
+    return result
 
 
 def get_proxy_headers(request: Request) -> ProxyRequestHeaders:
@@ -486,18 +565,34 @@ def get_proxy_headers(request: Request) -> ProxyRequestHeaders:
         request (Request): The incoming HTTP request.
 
     Returns:
-        ProxyRequest: A named tuple containing the request headers and response headers.
+        ProxyRequest: A named tuple containing the request headers, response headers, and headers to remove.
     """
     request_headers = {k: v for k, v in request.headers.items() if k in SUPPORTED_REQUEST_HEADERS}
-    request_headers.update({k[2:].lower(): v for k, v in request.query_params.items() if k.startswith("h_")})
+    request_headers.update({k[2:].lower(): v for k, v in request.query_params.items() if k.lower().startswith("h_")})
+    request_headers.setdefault("user-agent", settings.user_agent)
 
     # Handle common misspelling of referer
     if "referrer" in request_headers:
         if "referer" not in request_headers:
             request_headers["referer"] = request_headers.pop("referrer")
+            
+    dest = request.query_params.get("d", "")
+    host = urlparse(dest).netloc.lower()
+            
+    if "vidoza" in host or "videzz" in host:
+        # Remove ALL empty headers
+        for h in list(request_headers.keys()):
+            v = request_headers[h]
+            if v is None or v.strip() == "":
+                request_headers.pop(h, None)
 
-    response_headers = {k[2:].lower(): v for k, v in request.query_params.items() if k.startswith("r_")}
-    return ProxyRequestHeaders(request_headers, response_headers)
+    response_headers = {k[2:].lower(): v for k, v in request.query_params.items() if k.lower().startswith("r_")}
+    
+    # Parse headers to remove from response (x_headers parameter)
+    x_headers_param = request.query_params.get("x_headers", "")
+    remove_headers = [h.strip().lower() for h in x_headers_param.split(",") if h.strip()] if x_headers_param else []
+    
+    return ProxyRequestHeaders(request_headers, response_headers, remove_headers)
 
 
 class EnhancedStreamingResponse(Response):
@@ -533,20 +628,13 @@ class EnhancedStreamingResponse(Response):
             logger.error(f"Error in listen_for_disconnect: {str(e)}")
 
     async def stream_response(self, send: Send) -> None:
+        # Track if response headers have been sent to prevent duplicate headers
+        response_started = False
+        # Track if response finalization (more_body: False) has been sent to prevent ASGI protocol violation
+        finalization_sent = False
         try:
             # Initialize headers
             headers = list(self.raw_headers)
-
-            # Set the transfer-encoding to chunked for streamed responses with content-length
-            # when content-length is present. This ensures we don't hit protocol errors
-            # if the upstream connection is closed prematurely.
-            for i, (name, _) in enumerate(headers):
-                if name.lower() == b"content-length":
-                    # Replace content-length with transfer-encoding: chunked for streaming
-                    headers[i] = (b"transfer-encoding", b"chunked")
-                    headers = [h for h in headers if h[0].lower() != b"content-length"]
-                    logger.debug("Switched from content-length to chunked transfer-encoding for streaming")
-                    break
 
             # Start the response
             await send(
@@ -556,6 +644,7 @@ class EnhancedStreamingResponse(Response):
                     "headers": headers,
                 }
             )
+            response_started = True
 
             # Track if we've sent any data
             data_sent = False
@@ -574,27 +663,29 @@ class EnhancedStreamingResponse(Response):
 
                 # Successfully streamed all content
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
-            except (httpx.RemoteProtocolError, h11._util.LocalProtocolError) as e:
-                # Handle connection closed errors
+                finalization_sent = True
+            except (httpx.RemoteProtocolError, httpx.ReadError, h11._util.LocalProtocolError) as e:
+                # Handle connection closed / read errors gracefully
                 if data_sent:
                     # We've sent some data to the client, so try to complete the response
-                    logger.warning(f"Remote protocol error after partial streaming: {e}")
+                    logger.warning(f"Upstream connection error after partial streaming: {e}")
                     try:
                         await send({"type": "http.response.body", "body": b"", "more_body": False})
+                        finalization_sent = True
                         logger.info(
                             f"Response finalized after partial content ({self.actual_content_length} bytes transferred)"
                         )
                     except Exception as close_err:
-                        logger.warning(f"Could not finalize response after remote error: {close_err}")
+                        logger.warning(f"Could not finalize response after upstream error: {close_err}")
                 else:
                     # No data was sent, re-raise the error
-                    logger.error(f"Protocol error before any data was streamed: {e}")
+                    logger.error(f"Upstream error before any data was streamed: {e}")
                     raise
         except Exception as e:
             logger.exception(f"Error in stream_response: {str(e)}")
-            if not isinstance(e, (ConnectionResetError, anyio.BrokenResourceError)):
+            if not isinstance(e, (ConnectionResetError, anyio.BrokenResourceError)) and not response_started:
+                # Only attempt to send error response if headers haven't been sent yet
                 try:
-                    # Try to send an error response if client is still connected
                     await send(
                         {
                             "type": "http.response.start",
@@ -604,36 +695,39 @@ class EnhancedStreamingResponse(Response):
                     )
                     error_message = f"Streaming error: {str(e)}".encode("utf-8")
                     await send({"type": "http.response.body", "body": error_message, "more_body": False})
+                    finalization_sent = True
                 except Exception:
                     # If we can't send an error response, just log it
+                    pass
+            elif response_started and not finalization_sent:
+                # Response already started but not finalized - gracefully close the stream
+                try:
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                    finalization_sent = True
+                except Exception:
                     pass
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         async with anyio.create_task_group() as task_group:
-            streaming_completed = False
             stream_func = partial(self.stream_response, send)
             listen_func = partial(self.listen_for_disconnect, receive)
 
             async def wrap(func: typing.Callable[[], typing.Awaitable[None]]) -> None:
                 try:
                     await func()
-                    # If this is the stream_response function and it completes successfully, mark as done
-                    if func == stream_func:
-                        nonlocal streaming_completed
-                        streaming_completed = True
                 except Exception as e:
-                    if isinstance(e, (httpx.RemoteProtocolError, h11._util.LocalProtocolError)):
-                        # Handle protocol errors more gracefully
-                        logger.warning(f"Protocol error during streaming: {e}")
-                    elif not isinstance(e, anyio.get_cancelled_exc_class()):
-                        logger.exception("Error in streaming task")
-                        # Only re-raise if it's not a protocol error or cancellation
+                    # Note: stream_response and listen_for_disconnect handle their own exceptions
+                    # internally. This is a safety net for any unexpected exceptions that might
+                    # escape due to future code changes.
+                    if not isinstance(e, anyio.get_cancelled_exc_class()):
+                        logger.exception(f"Unexpected error in streaming task: {type(e).__name__}: {e}")
+                        # Re-raise unexpected errors to surface bugs rather than silently swallowing them
                         raise
                 finally:
-                    # Only cancel the task group if we're in disconnect listener or
-                    # if streaming_completed is True (meaning we finished normally)
-                    if func == listen_func or streaming_completed:
-                        task_group.cancel_scope.cancel()
+                    # Cancel task group when either task completes or fails:
+                    # - stream_func finished (success or failure) -> stop listening for disconnect
+                    # - listen_func finished (client disconnected) -> stop streaming
+                    task_group.cancel_scope.cancel()
 
             # Start the streaming response in a separate task
             task_group.start_soon(wrap, stream_func)

@@ -66,6 +66,11 @@ async def show_speedtest_page():
     return RedirectResponse(url="/speedtest.html")
 
 
+@app.get("/url-generator")
+async def show_url_generator_page():
+    return RedirectResponse(url="/url_generator.html")
+
+
 @app.post(
     "/generate_encrypted_or_encoded_url",
     description="Generate a single encoded URL",
@@ -112,6 +117,7 @@ async def generate_url(request: GenerateUrlRequest):
         query_params=query_params,
         request_headers=request.request_headers,
         response_headers=request.response_headers,
+        remove_response_headers=request.remove_response_headers,
         encryption_handler=encryption_handler,
         expiration=request.expiration,
         ip=ip_str,
@@ -151,6 +157,7 @@ async def generate_urls(request: GenerateMultiUrlRequest):
             query_params=query_params,
             request_headers=url_item.request_headers,
             response_headers=url_item.response_headers,
+            remove_response_headers=url_item.remove_response_headers,
             encryption_handler=encryption_handler,
             expiration=request.expiration,
             ip=ip_str,

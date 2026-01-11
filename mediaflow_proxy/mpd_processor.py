@@ -7,7 +7,7 @@ from fastapi import Request, Response, HTTPException
 
 from mediaflow_proxy.drm.decrypter import decrypt_segment
 from mediaflow_proxy.utils.crypto_utils import encryption_handler
-from mediaflow_proxy.utils.http_utils import encode_mediaflow_proxy_url, get_original_scheme, ProxyRequestHeaders
+from mediaflow_proxy.utils.http_utils import encode_mediaflow_proxy_url, get_original_scheme, ProxyRequestHeaders, apply_header_manipulation
 from mediaflow_proxy.utils.dash_prebuffer import dash_prebuffer
 from mediaflow_proxy.configs import settings
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 async def process_manifest(
-    request: Request, mpd_dict: dict, proxy_headers: ProxyRequestHeaders, key_id: str = None, key: str = None
+    request: Request, mpd_dict: dict, proxy_headers: ProxyRequestHeaders, key_id: str = None, key: str = None, resolution: str = None
 ) -> Response:
     """
     Processes the MPD manifest and converts it to an HLS manifest.
@@ -26,11 +26,12 @@ async def process_manifest(
         proxy_headers (ProxyRequestHeaders): The headers to include in the request.
         key_id (str, optional): The DRM key ID. Defaults to None.
         key (str, optional): The DRM key. Defaults to None.
+        resolution (str, optional): Target resolution (e.g., '1080p', '720p'). Defaults to None.
 
     Returns:
         Response: The HLS manifest as an HTTP response.
     """
-    hls_content = build_hls(mpd_dict, request, key_id, key)
+    hls_content = build_hls(mpd_dict, request, key_id, key, resolution)
     
     # Start DASH pre-buffering in background if enabled
     if settings.enable_dash_prebuffer:
@@ -74,7 +75,8 @@ async def process_playlist(
         raise HTTPException(status_code=404, detail="Profile not found")
 
     hls_content = build_hls_playlist(mpd_dict, matching_profiles, request)
-    return Response(content=hls_content, media_type="application/vnd.apple.mpegurl", headers=proxy_headers.response)
+    response_headers = apply_header_manipulation({}, proxy_headers)
+    return Response(content=hls_content, media_type="application/vnd.apple.mpegurl", headers=response_headers)
 
 
 async def process_segment(
@@ -108,10 +110,11 @@ async def process_segment(
         # For non-DRM protected content, we just concatenate init and segment content
         decrypted_content = init_content + segment_content
 
-    return Response(content=decrypted_content, media_type=mimetype, headers=proxy_headers.response)
+    response_headers = apply_header_manipulation({}, proxy_headers)
+    return Response(content=decrypted_content, media_type=mimetype, headers=response_headers)
 
 
-def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = None) -> str:
+def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = None, resolution: str = None) -> str:
     """
     Builds an HLS manifest from the MPD manifest.
 
@@ -120,6 +123,7 @@ def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = N
         request (Request): The incoming HTTP request.
         key_id (str, optional): The DRM key ID. Defaults to None.
         key (str, optional): The DRM key. Defaults to None.
+        resolution (str, optional): Target resolution (e.g., '1080p', '720p'). Defaults to None.
 
     Returns:
         str: The HLS manifest as a string.
@@ -148,6 +152,10 @@ def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = N
         elif "audio" in profile["mimeType"]:
             audio_profiles[profile["id"]] = (profile, playlist_url)
 
+    # Filter video profiles by resolution if specified
+    if resolution and video_profiles:
+        video_profiles = _filter_video_profiles_by_resolution(video_profiles, resolution)
+
     # Add audio streams
     for i, (profile, playlist_url) in enumerate(audio_profiles.values()):
         is_default = "YES" if i == 0 else "NO"  # Set the first audio track as default
@@ -165,6 +173,51 @@ def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = N
         hls.append(playlist_url)
 
     return "\n".join(hls)
+
+
+def _filter_video_profiles_by_resolution(video_profiles: dict, target_resolution: str) -> dict:
+    """
+    Filter video profiles to select the one matching the target resolution.
+    Falls back to closest lower resolution if exact match not found.
+
+    Args:
+        video_profiles: Dictionary of profile_id -> (profile, playlist_url).
+        target_resolution: Target resolution string (e.g., '1080p', '720p').
+
+    Returns:
+        Filtered dictionary with only the selected profile.
+    """
+    # Parse target height from "1080p" -> 1080
+    target_height = int(target_resolution.rstrip('p'))
+
+    # Convert to list and sort by height descending
+    profiles_list = [
+        (profile_id, profile, playlist_url)
+        for profile_id, (profile, playlist_url) in video_profiles.items()
+        if profile.get("height", 0) > 0
+    ]
+    
+    if not profiles_list:
+        logger.warning("No video profiles with valid height found, returning all profiles")
+        return video_profiles
+
+    sorted_profiles = sorted(profiles_list, key=lambda x: x[1]["height"], reverse=True)
+
+    # Find exact match or closest lower
+    selected = None
+    for profile_id, profile, playlist_url in sorted_profiles:
+        if profile["height"] <= target_height:
+            selected = (profile_id, profile, playlist_url)
+            break
+
+    # If all profiles are higher than target, use lowest available
+    if selected is None:
+        selected = sorted_profiles[-1]
+
+    profile_id, profile, playlist_url = selected
+    logger.info(f"Selected MPD video profile with resolution {profile['width']}x{profile['height']} for target {target_resolution}")
+    
+    return {profile_id: (profile, playlist_url)}
 
 
 def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -> str:
