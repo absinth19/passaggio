@@ -42,11 +42,28 @@ MediaFlow Proxy is a powerful and flexible solution for proxifying various types
 - Works with content IDs (`acestream://...`) and infohashes (magnet links)
 - Compatible with any media player that supports HLS or MPEG-TS
 
+### Telegram MTProto Proxy
+- **Telegram video streaming** - Stream videos from Telegram channels, groups, and DMs through MediaFlow
+- **High-speed parallel downloads** using FastTelethon technique (up to 20+ MB/s)
+- **Full range-request support** - Seeking works seamlessly in video players
+- Support for **t.me links** and direct file references
+- Works with public channels, private channels (if member), groups, and DMs
+- Persistent session management with automatic reconnection
+
 ### Security
 - API password protection against unauthorized access & Network bandwidth abuse prevention
 - Parameter encryption to hide sensitive information
 - Optional IP-based access control for encrypted URLs
 - URL expiration support for encrypted URLs
+
+### On-the-fly Transcoding
+- **Universal video/audio transcoding** to browser-compatible fMP4 (H.264 + AAC)
+- **GPU hardware acceleration** (NVIDIA NVENC, Apple VideoToolbox, Intel VAAPI/QSV) with automatic CPU fallback
+- Supports **any input container** (MKV, MP4, TS, WebM, FLV, etc.) and codec (HEVC, VP8/VP9, MPEG-2, MPEG-4, AC3, EAC3, Vorbis, Opus, etc.)
+- **On-the-fly streaming** -- no full-file buffering; pipe-based demuxing for MKV/TS/WebM and moov-atom probing for MP4
+- **Smart format detection** -- filename extension hints + magic byte sniffing to avoid wasteful probe attempts
+- Available on **all proxy endpoints**: `/proxy/stream`, Telegram, Acestream, and Xtream Codes
+- Triggered by `&transcode=true` query parameter with optional `&start=<seconds>` for seeking
 
 ### Additional Features
 - Built-in speed test for RealDebrid and AllDebrid services
@@ -169,6 +186,50 @@ Set the following environment variables:
 - `DASH_SEGMENT_CACHE_TTL`: Optional. TTL in seconds for cached DASH segments. Default: `60`. Longer values help with slow network playback.
 - `FORWARDED_ALLOW_IPS`: Optional. Controls which IP addresses are trusted to provide forwarded headers (X-Forwarded-For, X-Forwarded-Proto, etc.) when MediaFlow Proxy is deployed behind reverse proxies or load balancers. Default: `127.0.0.1`. See [Forwarded Headers Configuration](#forwarded-headers-configuration) for detailed usage.
 
+### Redis Configuration (Optional)
+
+Redis enables cross-worker coordination for rate limiting and caching. This is **recommended** when running with multiple workers (`--workers N`) to prevent CDN rate-limiting issues (e.g., Vidoza 509 errors).
+
+- `REDIS_URL`: Optional. Redis connection URL. Default: `None` (disabled). Example: `redis://localhost:6379` or `redis://user:pass@host:6379/0`.
+
+**When to use Redis:**
+- Running multiple uvicorn workers (`--workers 4` or more)
+- Streaming from rate-limited CDNs like Vidoza
+- Need shared caching across workers (extractor results, HEAD responses, segments)
+
+**Features enabled by Redis:**
+- **Rate limiting**: Prevents rapid-fire requests that trigger CDN 509 errors
+- **HEAD cache**: Serves repeated HEAD probes (e.g., ExoPlayer) without upstream connections
+- **Stream gate**: Serializes initial connections to rate-limited URLs
+- **Extractor cache**: Shares extraction results across all workers
+- **Segment cache**: Shares downloaded segments across workers
+
+**Docker Compose example with Redis:**
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mediaflow-proxy:
+    image: mhdzumair/mediaflow-proxy:latest
+    ports:
+      - "8888:8888"
+    environment:
+      - API_PASSWORD=your_password
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+```
+
+**Note**: If Redis is not configured, MediaFlow Proxy works normally but rate limiting features are disabled. This is fine for single-worker deployments or CDNs that don't rate-limit aggressively.
+
 ### Acestream Configuration
 
 MediaFlow Proxy can act as a proxy for Acestream P2P streams, converting them to HLS or MPEG-TS format that any media player can consume.
@@ -195,6 +256,8 @@ MediaFlow Proxy can act as a proxy for Acestream P2P streams, converting them to
 |-----------|-------------|
 | `id` | Acestream content ID (alternative to infohash) |
 | `infohash` | Acestream infohash (40-char hex from magnet link) |
+| `transcode` | Set to `true` to transcode to browser-compatible fMP4 (H.264 + AAC) |
+| `start` | Seek start time in seconds (used with `transcode=true`) |
 
 **Example URLs:**
 ```
@@ -203,6 +266,9 @@ https://your-mediaflow/proxy/acestream/stream?id=YOUR_CONTENT_ID&api_password=yo
 
 # MPEG-TS stream (infohash from magnet)
 https://your-mediaflow/proxy/acestream/stream?infohash=b04372b9543d763bd2dbd2a1842d9723fd080076&api_password=your_password
+
+# Transcode to browser-compatible fMP4
+https://your-mediaflow/proxy/acestream/stream?id=YOUR_CONTENT_ID&transcode=true&api_password=your_password
 
 # HLS manifest (alternative)
 https://your-mediaflow/proxy/acestream/manifest.m3u8?id=YOUR_CONTENT_ID&api_password=your_password
@@ -226,6 +292,119 @@ services:
     image: ghcr.io/martinbjeldbak/acestream-http-proxy:latest # or build it from https://github.com/sergiomarquezdev/acestream-docker-home
     ports:
       - "6878:6878"
+```
+
+### Telegram MTProto Configuration
+
+MediaFlow Proxy can stream Telegram media (videos, documents, photos) through the MTProto protocol, enabling high-speed parallel downloads with full HTTP range request support for seeking.
+
+**Requirements**: 
+- Telegram API credentials from [my.telegram.org/apps](https://my.telegram.org/apps)
+- A valid session string (generated once, see below)
+
+> **Note**: Telethon and cryptg are included as standard dependencies - no extra installation needed.
+
+#### Configuration
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `ENABLE_TELEGRAM` | Enable Telegram proxy support | `false` |
+| `TELEGRAM_API_ID` | Telegram API ID from my.telegram.org | Required |
+| `TELEGRAM_API_HASH` | Telegram API Hash from my.telegram.org | Required |
+| `TELEGRAM_SESSION_STRING` | Persistent session string (see below) | Required |
+| `TELEGRAM_MAX_CONNECTIONS` | Max parallel DC connections | `8` |
+| `TELEGRAM_REQUEST_TIMEOUT` | Request timeout in seconds | `30` |
+
+#### Generating a Session String
+
+The session string authenticates MediaFlow with Telegram. Generate it using the web UI:
+
+1. Open MediaFlow's URL Generator page at `/url-generator#telegram`
+2. Navigate to the **Session String Generator** section
+3. Enter your API ID and API Hash (from https://my.telegram.org/apps)
+4. Choose authentication method (user account or bot)
+5. Complete authentication (phone number + code, or bot token)
+
+Add the generated session string to your configuration:
+
+```env
+ENABLE_TELEGRAM=true
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=your_api_hash_here
+TELEGRAM_SESSION_STRING=your_session_string_here
+```
+
+> **Security Note**: The session string is equivalent to a password. Keep it secret!
+
+#### Telegram Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/proxy/telegram/stream` | Stream media from t.me link or file_id |
+| `/proxy/telegram/stream/{filename}` | Stream with custom filename |
+| `/proxy/telegram/transcode/playlist.m3u8` | HLS transcode playlist (recommended for browser playback and smooth seeking) |
+| `/proxy/telegram/transcode/init.mp4` | fMP4 init segment for Telegram transcode playlist |
+| `/proxy/telegram/transcode/segment.m4s` | fMP4 media segment for Telegram transcode playlist |
+| `/proxy/telegram/info` | Get media metadata |
+| `/proxy/telegram/status` | Session status and health check |
+
+#### URL Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `d` or `url` | t.me link (e.g., `https://t.me/channel/123`) |
+| `chat_id` | Chat/Channel ID (use with `message_id`) - numeric ID or @username |
+| `message_id` | Message ID within the chat (use with `chat_id`) |
+| `file_id` | Bot API file_id (use with `file_size`) |
+| `file_size` | File size in bytes (required when using `file_id`) |
+| `transcode` | Set to `true` for direct transcode mode on `/proxy/telegram/stream` (URL Generator defaults to `/proxy/telegram/transcode/playlist.m3u8` when no start time is set) |
+| `start` | Seek start time in seconds (direct transcode mode only, used with `transcode=true`) |
+
+#### Supported Input Formats
+
+**Option 1: t.me URLs**
+- **Public channels**: `https://t.me/channelname/123`
+- **Private channels**: `https://t.me/c/123456789/456`
+- **User messages**: `https://t.me/username/123`
+
+**Option 2: Direct IDs**
+- `chat_id=-1001234567890&message_id=123` - Private channel/supergroup by numeric ID
+- `chat_id=@channelname&message_id=123` - Public channel by username
+
+**Option 3: Bot API file_id**
+- `file_id=BQACAgI...&file_size=1048576` - Direct streaming by file_id
+- Requires `file_size` parameter for range request support (seeking in video players)
+- Get file_id and file_size from Telegram Bot API's `getFile` response
+
+#### Example URLs
+
+```bash
+# Stream from public channel using t.me link
+mpv "http://localhost:8888/proxy/telegram/stream?d=https://t.me/channelname/123&api_password=your_password"
+
+# Stream using chat_id + message_id
+mpv "http://localhost:8888/proxy/telegram/stream?chat_id=-1001234567890&message_id=123&api_password=your_password"
+
+# Stream with username instead of numeric ID
+mpv "http://localhost:8888/proxy/telegram/stream?chat_id=@channelname&message_id=456&api_password=your_password"
+
+# Stream using Bot API file_id (requires file_size)
+mpv "http://localhost:8888/proxy/telegram/stream?file_id=BQACAgIAAxkBAAI...&file_size=52428800&api_password=your_password"
+
+# Stream with custom filename
+mpv "http://localhost:8888/proxy/telegram/stream/movie.mp4?d=https://t.me/channelname/123&api_password=your_password"
+
+# Get media info
+curl "http://localhost:8888/proxy/telegram/info?d=https://t.me/channelname/123&api_password=your_password"
+
+# Get media info using chat_id + message_id
+curl "http://localhost:8888/proxy/telegram/info?chat_id=-1001234567890&message_id=123&api_password=your_password"
+
+# Get media info using file_id
+curl "http://localhost:8888/proxy/telegram/info?file_id=BQACAgIAAxkBAAI...&api_password=your_password"
+
+# Check status
+curl "http://localhost:8888/proxy/telegram/status?api_password=your_password"
 ```
 
 ### Transport Configuration
@@ -913,10 +1092,64 @@ Ideal for users who want a reliable, plug-and-play solution without the technica
 4. `/proxy/mpd/playlist.m3u8`: Generate HLS playlists from MPD
 5. `/proxy/mpd/segment.mp4`: Process and decrypt media segments
 6. `/proxy/ip`: Get the public IP address of the MediaFlow Proxy server
-7. `/extractor/video?host=`: Extract direct video stream URLs from supported hosts (see supported hosts in API docs)
+7. `/extractor/video`: Extract direct video stream URLs from supported hosts (see below)
 8. `/playlist/builder`: Build and customize playlists from multiple sources
+9. `/proxy/transcode/playlist.m3u8`: Generate HLS VOD playlist for generic stream transcode
+10. `/proxy/transcode/init.mp4`: fMP4 init segment for generic transcode playlist
+11. `/proxy/transcode/segment.m4s`: fMP4 media segment for generic transcode playlist
+12. `/proxy/telegram/transcode/playlist.m3u8`: Generate HLS VOD playlist for Telegram transcode
+13. `/proxy/telegram/transcode/init.mp4`: fMP4 init segment for Telegram transcode playlist
+14. `/proxy/telegram/transcode/segment.m4s`: fMP4 media segment for Telegram transcode playlist
 
 Once the server is running, for more details on the available endpoints and their parameters, visit the Swagger UI at `http://localhost:8888/docs`.
+
+### Video Extractor Endpoint
+
+The extractor endpoint extracts direct video stream URLs from various video hosting services. It supports an optional file extension in the URL for better player compatibility.
+
+#### Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/extractor/video` | Base endpoint (generic, backward compatible) |
+| `/extractor/video.m3u8` | HLS streams - helps ExoPlayer detect HLS |
+| `/extractor/video.mp4` | MP4 streams |
+| `/extractor/video.mkv` | MKV streams |
+| `/extractor/video.ts` | MPEG-TS streams |
+| `/extractor/video.webm` | WebM streams |
+| `/extractor/video.avi` | AVI streams |
+
+#### Why Use Extensions?
+
+Some video players (notably Android's ExoPlayer used in Stremio) determine the media source type from the URL before making any HTTP requests. Without the correct extension:
+
+- ExoPlayer sees `/extractor/video?...` → Uses `ProgressiveMediaSource`
+- ExoPlayer sees `/extractor/video.m3u8?...` → Uses `HlsMediaSource` ✓
+
+For HLS streams, using the `.m3u8` extension ensures the player uses the correct HLS playback pipeline.
+
+#### Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `host` | Yes | Extractor host name (e.g., `TurboVidPlay`, `Vidoza`) |
+| `d` | Yes | Destination URL (the video page URL to extract) |
+| `api_password` | Yes* | API password (*if configured) |
+| `redirect_stream` | No | If `true`, returns 302 redirect to the proxied stream URL |
+
+#### Example Usage
+
+**Get extraction result as JSON:**
+```
+GET /extractor/video?host=Vidoza&d=https://videzz.net/example.html&api_password=your_password
+```
+
+**Redirect directly to stream (for players):**
+```
+GET /extractor/video.m3u8?host=TurboVidPlay&d=https://turbovidhls.com/t/abc123&api_password=your_password&redirect_stream=true
+```
+
+This redirects to the proxied HLS manifest URL, and because the request URL contains `.m3u8`, players like ExoPlayer will correctly use HLS playback.
 
 ### Xtream Codes (XC) API Proxy
 
@@ -1098,6 +1331,44 @@ Apply stream content transformations for specific hosting providers.
 - **Example:** `&transformer=ts_stream&x_headers=content-length,content-range` for streams with PNG wrappers.
 - **Note:** This parameter is automatically set when using extractors for supported hosts.
 
+**`/proxy/transcode/playlist.m3u8` and `/proxy/telegram/transcode/playlist.m3u8` (recommended)**  
+Use HLS transcode playlists for smooth browser playback and robust seeking with fMP4 segments.  
+- **Usage:** Open the playlist endpoint directly with `d` (or Telegram params), optional `api_password`, and optional `h_*` headers.  
+- **Effect:** Generates an HLS VOD playlist that references `init.mp4` + `segment.m4s` endpoints with browser-compatible H.264/AAC output.  
+- **URL Generator behavior:** When transcode is enabled and no start time is provided, URL Generator outputs these playlist URLs by default.
+
+**`&transcode=true` (direct mode)**  
+Transcode the stream directly to browser-compatible fragmented MP4 (fMP4) with H.264 video and AAC audio.  
+- **Usage:** Add `&transcode=true` to `/proxy/stream`, `/proxy/telegram/stream`, `/proxy/acestream/stream`, or Xtream Codes live/movie/series stream URLs.  
+- **Effect:** Re-encodes unsupported video codecs (HEVC, VP8/VP9, MPEG-2, MPEG-4, etc.) to H.264 and unsupported audio codecs (AC3, EAC3, Vorbis, Opus, FLAC, DTS, etc.) to AAC. Browser-compatible codecs (H.264 video, AAC audio) are passed through without re-encoding.  
+- **GPU Acceleration:** Automatically uses GPU encoding when available (NVIDIA NVENC, Apple VideoToolbox, Intel VAAPI/QSV). Falls back to CPU (libx264) otherwise.  
+- **On-the-fly:** Streaming is real-time with pipe-based demuxing. For MP4 inputs, the moov atom is probed and rewritten for immediate playback without downloading the full file.
+
+**`&start=120`**  
+Seek to a specific time position before starting transcoded playback.  
+- **Usage:** Add `&start=120` (value in seconds) alongside `&transcode=true` in direct transcode mode  
+- **Effect:** Starts transcoding from the specified time offset. For indexed containers (MKV cues, MP4 moov), this seeks to the nearest keyframe. For non-indexed formats (TS), this is a byte-estimate seek.  
+- **Supported Endpoints:** `/proxy/stream`, `/proxy/telegram/stream`, `/proxy/acestream/stream`, Xtream Codes live/movie/series endpoints  
+- **Note:** `start` is not used by `/proxy/transcode/playlist.m3u8` or `/proxy/telegram/transcode/playlist.m3u8` endpoints.
+- **Example:** `&transcode=true&start=300` starts playback from 5 minutes into the stream
+
+**`&ratelimit=vidoza`**  
+Apply host-specific rate limiting to prevent CDN 509 (Bandwidth Limit Exceeded) errors. Requires Redis to be configured.  
+- **Usage:** Add `&ratelimit=handler_id` to the `/proxy/stream` URL  
+- **Effect:** Limits the frequency of upstream connections to avoid triggering rate limits on aggressive CDNs.  
+- **Auto-detection:** If not specified, rate limiting is automatically applied for known hosts (e.g., Vidoza).  
+- **Available Handlers:**
+  - `vidoza` - 5-second cooldown between connections, HEAD caching, stream gating (auto-detected for vidoza.net)
+  - `aggressive` - 3-second cooldown, suitable for other rate-limited hosts
+  - `none` - Explicitly disable rate limiting (use when auto-detection is unwanted)
+- **How it works:** When a rate-limited stream is requested:
+  1. HEAD responses are cached to serve repeated probes without upstream connections
+  2. A cooldown period prevents rapid-fire GET requests
+  3. If another request arrives during cooldown, returns `503 Service Unavailable` with `Retry-After` header
+  4. Players automatically retry after the cooldown, resulting in smooth playback
+- **Requires:** `REDIS_URL` must be configured for rate limiting to function. Without Redis, rate limiting is disabled.
+- **Example:** `&ratelimit=vidoza` for Vidoza streams, or `&ratelimit=none` to disable auto-detection.
+
 **`&rp_content-type=video/mp2t`**  
 Set response headers that propagate to HLS/DASH segments.  
 - **Usage:** Add `&rp_header-name=value` to the proxy URL (rp_ prefix)  
@@ -1190,6 +1461,51 @@ mpv "http://localhost:8888/proxy/acestream/manifest.m3u8?id=your_content_id&star
 ```
 
 **Note:** The `start_offset` parameter is particularly useful for live streams where the prebuffer system cannot prefetch segments when sitting at the live edge. By starting slightly behind (e.g., `-18` seconds), there are future segments available for prebuffering, resulting in smoother playback. This works for both native HLS and DASH/MPD streams converted to HLS.
+
+#### Transcode Stream for Browser Playback
+
+```bash
+# Recommended: HLS transcode playlist for generic streams
+mpv "http://localhost:8888/proxy/transcode/playlist.m3u8?d=https://example.com/video.mkv&api_password=your_password"
+
+# Recommended: HLS transcode playlist for Telegram streams
+mpv "http://localhost:8888/proxy/telegram/transcode/playlist.m3u8?d=https://t.me/channelname/123&api_password=your_password"
+
+# Direct transcode mode with explicit seek start (start at 5 minutes)
+mpv "http://localhost:8888/proxy/stream?d=https://example.com/video.mp4&transcode=true&start=300&api_password=your_password"
+
+# Acestream transcode (direct mode)
+mpv "http://localhost:8888/proxy/acestream/stream?id=YOUR_CONTENT_ID&transcode=true&api_password=your_password"
+```
+
+**Note:** Transcoding uses GPU hardware acceleration when available (NVIDIA, Apple VideoToolbox, Intel). Browser-compatible codecs (H.264 video, AAC audio) are passed through without re-encoding to minimize resource usage.
+
+#### Transcode Performance Benchmarks
+
+Benchmark results for on-the-fly HEVC (H.265) to H.264 transcoding. Source: 4K (3840x2160) 30-second clip at 24fps with EAC3 5.1 audio, from a real movie file.
+
+**MediaFlow Proxy (on-the-fly streaming via PyAV pipeline):**
+
+| Source | Encoder | Wall Clock | Video Frames | Effective FPS | Output |
+|--------|---------|-----------|--------------|---------------|--------|
+| 4K HEVC MKV (EAC3) | VideoToolbox (GPU) | **11.7s** | 722 | **61.7 fps** | 15.1 MB |
+| 4K HEVC MKV (EAC3) | libx264 (CPU) | 26.2s | 722 | 27.6 fps | 15.1 MB |
+
+**Direct FFmpeg CLI baseline (local file, no HTTP proxy):**
+
+| Source | Encoder | Wall Clock | CPU Time | CPU Usage |
+|--------|---------|-----------|----------|-----------|
+| 4K HEVC MKV | VideoToolbox (GPU) | **11.9s** | 10.7s | 92% |
+| 4K HEVC MKV | libx264 (CPU) | 11.4s | 81.7s | 725% |
+
+**Key observations:**
+- **GPU MediaFlow matches direct FFmpeg** -- the optimized pipeline adds near-zero overhead (11.7s vs 11.9s)
+- GPU **exceeds real-time by 2.5x** for 4K 24fps content (62 fps), meaning no buffering delays
+- **GPU uses ~7x less CPU** than software encoding (92% vs 725%), leaving resources free for concurrent streams
+- The pipeline optimizations (thread-safe queues, eliminated async round-trips, skip redundant decoder flush) reduced GPU wall-clock from ~17s to ~11.7s (**31% improvement**)
+- On servers with NVIDIA GPUs, hardware HEVC decoding (`hevc_cuvid`) would further reduce both wall-clock time and CPU usage
+
+*Tested on Apple Silicon (M4) with PyAV 16.1.0 and FFmpeg 8.0. Results vary by hardware, content complexity, and network conditions.*
 
 #### Stream with Header Removal (Fix Content-Length Issues)
 
