@@ -8,6 +8,15 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    pkg-config \
+    libffi-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavfilter-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswresample-dev \
+    libswscale-dev \
     libxml2-dev \
     libxslt-dev \
     zlib1g-dev \
@@ -18,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Add Rust to PATH
 ENV PATH="/root/.cargo/bin:$PATH"
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Install uv without relying on a platform-specific external stage
+RUN pip install --no-cache-dir uv
 
 # Copy only requirements to cache them in docker layer
 COPY pyproject.toml uv.lock* /build/
@@ -33,10 +42,20 @@ FROM python:3.14-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE="1"
 ENV PYTHONUNBUFFERED="1"
-ENV PORT="8888"
+ENV PORT="8888" \
+    GUNICORN_WORKERS="4" \
+    GUNICORN_WORKER_CLASS="uvicorn.workers.UvicornWorker" \
+    GUNICORN_TIMEOUT="120" \
+    GUNICORN_MAX_REQUESTS="500" \
+    GUNICORN_MAX_REQUESTS_JITTER="200" \
+    GUNICORN_ACCESS_LOGFILE="-" \
+    GUNICORN_ERROR_LOGFILE="-" \
+    GUNICORN_LOG_LEVEL="info"
 
 # Install only runtime dependencies (no dev packages)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libffi8 \
     libxml2 \
     libxslt1.1 \
     && apt-get clean \
@@ -67,4 +86,4 @@ ENV PATH="/mediaflow_proxy/.venv/bin:$PATH"
 EXPOSE 8888
 
 # Run the application with Gunicorn (use python -m to avoid venv path issues)
-CMD ["sh", "-c", "exec python -m gunicorn mediaflow_proxy.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8888 --timeout 120 --max-requests 500 --max-requests-jitter 200 --access-logfile - --error-logfile - --log-level info --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]
+CMD ["sh", "-c", "exec python -m gunicorn mediaflow_proxy.main:app -w \"${WEB_CONCURRENCY:-${GUNICORN_WORKERS:-4}}\" -k \"${GUNICORN_WORKER_CLASS:-uvicorn.workers.UvicornWorker}\" --bind \"${GUNICORN_BIND:-0.0.0.0:${PORT:-8888}}\" --timeout \"${GUNICORN_TIMEOUT:-120}\" --max-requests \"${GUNICORN_MAX_REQUESTS:-500}\" --max-requests-jitter \"${GUNICORN_MAX_REQUESTS_JITTER:-200}\" --access-logfile \"${GUNICORN_ACCESS_LOGFILE:--}\" --error-logfile \"${GUNICORN_ERROR_LOGFILE:--}\" --log-level \"${GUNICORN_LOG_LEVEL:-info}\" --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]
